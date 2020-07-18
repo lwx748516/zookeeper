@@ -81,6 +81,11 @@ public class NIOServerCnxn extends ServerCnxn {
      */
     private long sessionId;
 
+    /**
+     * Client socket option for TCP keepalive
+     */
+    private final boolean clientTcpKeepAlive = Boolean.getBoolean("zookeeper.clientTcpKeepAlive");
+
     public NIOServerCnxn(ZooKeeperServer zk, SocketChannel sock, SelectionKey sk, NIOServerCnxnFactory factory, SelectorThread selectorThread) throws IOException {
         super(zk);
         this.sock = sock;
@@ -93,6 +98,7 @@ public class NIOServerCnxn extends ServerCnxn {
         sock.socket().setTcpNoDelay(true);
         /* set socket linger to false, so that socket close does not block */
         sock.socket().setSoLinger(false, -1);
+        sock.socket().setKeepAlive(clientTcpKeepAlive);
         InetAddress addr = ((InetSocketAddress) sock.socket().getRemoteSocketAddress()).getAddress();
         addAuthInfo(new Id("ip", addr.getHostAddress()));
         this.sessionTimeout = factory.sessionlessCnxnTimeout;
@@ -549,13 +555,6 @@ public class NIOServerCnxn extends ServerCnxn {
         return true;
     }
 
-    /**
-     * @return true if the server is running, false otherwise.
-     */
-    boolean isZKServerRunning() {
-        return zkServer != null && zkServer.isRunning();
-    }
-
     /*
      * (non-Javadoc)
      *
@@ -666,13 +665,18 @@ public class NIOServerCnxn extends ServerCnxn {
     private static final ByteBuffer packetSentinel = ByteBuffer.allocate(0);
 
     @Override
-    public void sendResponse(ReplyHeader h, Record r, String tag, String cacheKey, Stat stat, int opCode) {
+    public int sendResponse(ReplyHeader h, Record r, String tag, String cacheKey, Stat stat, int opCode) {
+        int responseSize = 0;
         try {
-            sendBuffer(serialize(h, r, tag, cacheKey, stat, opCode));
+            ByteBuffer[] bb = serialize(h, r, tag, cacheKey, stat, opCode);
+            responseSize = bb[0].getInt();
+            bb[0].rewind();
+            sendBuffer(bb);
             decrOutstandingAndCheckThrottle(h);
         } catch (Exception e) {
             LOG.warn("Unexpected exception. Destruction averted.", e);
         }
+        return responseSize;
     }
 
     /*
@@ -696,7 +700,8 @@ public class NIOServerCnxn extends ServerCnxn {
         // The last parameter OpCode here is used to select the response cache.
         // Passing OpCode.error (with a value of -1) means we don't care, as we don't need
         // response cache on delivering watcher events.
-        sendResponse(h, e, "notification", null, null, ZooDefs.OpCode.error);
+        int responseSize = sendResponse(h, e, "notification", null, null, ZooDefs.OpCode.error);
+        ServerMetrics.getMetrics().WATCH_BYTES.add(responseSize);
     }
 
     /*

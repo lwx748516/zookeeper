@@ -244,6 +244,8 @@ typedef struct _completion_list {
 } completion_list_t;
 
 const char*err2string(int err);
+static inline int calculate_interval(const struct timeval *start,
+        const struct timeval *end);
 static int queue_session_event(zhandle_t *zh, int state);
 static const char* format_endpoint_info(const struct sockaddr_storage* ep);
 
@@ -342,6 +344,7 @@ static int is_sasl_auth_in_progress(zhandle_t* zh)
 #endif /* HAVE_CYRUS_SASL_H */
 }
 
+#ifndef THREADED
 /*
  * abort due to the use of a sync api in a singlethreaded environment
  */
@@ -350,6 +353,7 @@ static void abort_singlethreaded(zhandle_t *zh)
     LOG_ERROR(LOGCALLBACK(zh), "Sync completion used without threads");
     abort();
 }
+#endif  /* THREADED */
 
 static ssize_t zookeeper_send(zsock_t *fd, const void* buf, size_t len)
 {
@@ -982,10 +986,14 @@ fail:
  *
  * See zoo_cycle_next_server for the selection logic.
  *
+ * \param ref_time an optional "reference time," used to determine if
+ * resolution can be skipped in accordance to the delay set by \ref
+ * zoo_set_servers_resolution_delay.  Passing NULL prevents skipping.
+ *
  * See {@link https://issues.apache.org/jira/browse/ZOOKEEPER-1355} for the
  * protocol and its evaluation,
  */
-int update_addrs(zhandle_t *zh)
+int update_addrs(zhandle_t *zh, const struct timeval *ref_time)
 {
     int rc = ZOK;
     char *hosts = NULL;
@@ -1006,26 +1014,54 @@ int update_addrs(zhandle_t *zh)
         return ZSYSTEMERROR;
     }
 
-    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new}
+    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new, last_resolve, resolve_delay_ms}
     lock_reconfig(zh);
+
+    // Check if we are due for a host name resolution.  (See
+    // zoo_set_servers_resolution_delay.  The answer is always "yes"
+    // if no reference is provided or the file descriptor is invalid.)
+    if (ref_time && zh->fd->sock != -1) {
+        int do_resolve;
+
+        if (zh->resolve_delay_ms <= 0) {
+            // -1 disables, 0 means unconditional.  Fail safe.
+            do_resolve = zh->resolve_delay_ms != -1;
+        } else {
+            int elapsed_ms = calculate_interval(&zh->last_resolve, ref_time);
+            // Include < 0 in case of overflow, or if we are not
+            // backed by a monotonic clock.
+            do_resolve = elapsed_ms > zh->resolve_delay_ms || elapsed_ms < 0;
+        }
+
+        if (!do_resolve) {
+            goto finish;
+        }
+    }
 
     // Copy zh->hostname for local use
     hosts = strdup(zh->hostname);
     if (hosts == NULL) {
         rc = ZSYSTEMERROR;
-        goto fail;
+        goto finish;
     }
 
     rc = resolve_hosts(zh, hosts, &resolved);
     if (rc != ZOK)
     {
-        goto fail;
+        goto finish;
+    }
+
+    // Unconditionally note last resolution time.
+    if (ref_time) {
+        zh->last_resolve = *ref_time;
+    } else {
+        get_system_time(&zh->last_resolve);
     }
 
     // If the addrvec list is identical to last time we ran don't do anything
     if (addrvec_eq(&zh->addrs, &resolved))
     {
-        goto fail;
+        goto finish;
     }
 
     // Is the server we're connected to in the new resolved list?
@@ -1045,14 +1081,14 @@ int update_addrs(zhandle_t *zh)
             rc = addrvec_append(&zh->addrs_old, resolved_address);
             if (rc != ZOK)
             {
-                goto fail;
+                goto finish;
             }
         }
         else {
             rc = addrvec_append(&zh->addrs_new, resolved_address);
             if (rc != ZOK)
             {
-                goto fail;
+                goto finish;
             }
         }
     }
@@ -1105,13 +1141,13 @@ int update_addrs(zhandle_t *zh)
         zh->state = ZOO_NOTCONNECTED_STATE;
     }
 
-fail:
+finish:
 
     unlock_reconfig(zh);
 
     // If we short-circuited out and never assigned resolved to zh->addrs then we
     // need to free resolved to avoid a memleak.
-    if (zh->addrs.data != resolved.data)
+    if (resolved.data && zh->addrs.data != resolved.data)
     {
         addrvec_free(&resolved);
     }
@@ -1308,7 +1344,7 @@ static zhandle_t *zookeeper_init_internal(const char *host, watcher_fn watcher,
     if (zh->hostname == 0) {
         goto abort;
     }
-    if(update_addrs(zh) != 0) {
+    if(update_addrs(zh, NULL) != 0) {
         goto abort;
     }
 
@@ -1402,7 +1438,7 @@ int zoo_set_servers(zhandle_t *zh, const char *hosts)
         return ZBADARGUMENTS;
     }
 
-    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new}
+    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new, last_resolve, resolve_delay_ms}
     lock_reconfig(zh);
 
     // Reset hostname to new set of hosts to connect to
@@ -1414,7 +1450,27 @@ int zoo_set_servers(zhandle_t *zh, const char *hosts)
 
     unlock_reconfig(zh);
 
-    return update_addrs(zh);
+    return update_addrs(zh, NULL);
+}
+
+/*
+ * Sets a minimum delay to observe between "routine" host name
+ * resolutions.  See prototype for full documentation.
+ */
+int zoo_set_servers_resolution_delay(zhandle_t *zh, int delay_ms) {
+    if (delay_ms < -1) {
+        LOG_ERROR(LOGCALLBACK(zh), "Resolution delay cannot be %d", delay_ms);
+        return ZBADARGUMENTS;
+    }
+
+    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new, last_resolve, resolve_delay_ms}
+    lock_reconfig(zh);
+
+    zh->resolve_delay_ms = delay_ms;
+
+    unlock_reconfig(zh);
+
+    return ZOK;
 }
 
 /**
@@ -1479,7 +1535,7 @@ static int get_next_server_in_reconfig(zhandle_t *zh)
  */
 void zoo_cycle_next_server(zhandle_t *zh)
 {
-    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new}
+    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new, last_resolve, resolve_delay_ms}
     lock_reconfig(zh);
 
     memset(&zh->addr_cur, 0, sizeof(zh->addr_cur));
@@ -1511,7 +1567,7 @@ const char* zoo_get_current_server(zhandle_t* zh)
 {
     const char *endpoint_info = NULL;
 
-    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new}
+    // NOTE: guard access to {hostname, addr_cur, addrs, addrs_old, addrs_new, last_resolve, resolve_delay_ms}
     // Need the lock here as it is changed in update_addrs()
     lock_reconfig(zh);
 
@@ -2413,7 +2469,7 @@ int zookeeper_interest(zhandle_t *zh, socket_t *fd, int *interest,
     }
     api_prolog(zh);
 
-    rc = update_addrs(zh);
+    rc = update_addrs(zh, &now);
     if (rc != ZOK) {
         return api_epilog(zh, rc);
     }
@@ -3644,6 +3700,49 @@ static int add_multi_completion(zhandle_t *zh, int xid, void_completion_t dc,
     return add_completion(zh, xid, COMPLETION_MULTI, dc, data, 0,0, clist);
 }
 
+/**
+ * After sending the close request, we are waiting for a given millisecs for
+ * getting the answer and/or for the socket to be closed by the server.
+ *
+ * This function should not be called while we still want to process
+ * any response from the server. It must be called after adaptor_finish called,
+ * in order not to mess with the I/O receiver thread in multi-threaded mode.
+ */
+int wait_for_session_to_be_closed(zhandle_t *zh, int timeout_ms)
+{
+    int ret = 0;
+#ifndef WIN32
+    struct pollfd fd_s[1];
+#else
+    fd_set rfds;
+    struct timeval waittime = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+#endif
+
+    if (zh == NULL) {
+        return ZBADARGUMENTS;
+    }
+
+#ifndef WIN32
+    fd_s[0].fd = zh->fd->sock;
+    fd_s[0].events = POLLIN;
+    ret = poll(fd_s, 1, timeout_ms);
+#else
+    FD_ZERO(&rfds);
+    FD_SET(zh->fd->sock , &rfds);
+    ret = select(zh->fd->sock + 1, &rfds, NULL, NULL, &waittime);
+#endif
+
+    if (ret == 0){
+        LOG_WARN(LOGCALLBACK(zh), "Timed out (%dms) during waiting for server's reply after sending a close request, sessionId=%#llx\n",
+            timeout_ms, zh->client_id.client_id);
+    } else if (ret < 0) {
+        LOG_WARN(LOGCALLBACK(zh), "System error (%d) happened while waiting for server's reply, sessionId=%#llx\n",
+            ret, zh->client_id.client_id);
+    }
+
+    return ZOK;
+}
+
 int zookeeper_close(zhandle_t *zh)
 {
     int rc=ZOK;
@@ -3669,32 +3768,33 @@ int zookeeper_close(zhandle_t *zh)
     }
     /* No need to decrement the counter since we're just going to
      * destroy the handle later. */
-    if (is_connected(zh)){
+    if (is_connected(zh)) {
         struct oarchive *oa;
         struct RequestHeader h = {get_xid(), ZOO_CLOSE_OP};
         LOG_INFO(LOGCALLBACK(zh), "Closing zookeeper sessionId=%#llx to %s\n",
-                zh->client_id.client_id,zoo_get_current_server(zh));
+            zh->client_id.client_id, zoo_get_current_server(zh));
         oa = create_buffer_oarchive();
         rc = serialize_RequestHeader(oa, "header", &h);
-        rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa),
-                get_buffer_len(oa));
+        rc = rc < 0 ? rc : queue_buffer_bytes(&zh->to_send, get_buffer(oa), get_buffer_len(oa));
         /* We queued the buffer, so don't free it */
         close_buffer_oarchive(&oa, 0);
         if (rc < 0) {
+            LOG_DEBUG(LOGCALLBACK(zh), "Error during closing zookeeper session, sessionId=%#llx to %s (error: %d)\n",
+                zh->client_id.client_id, zoo_get_current_server(zh), rc);
             rc = ZMARSHALLINGERROR;
-            goto finish;
-        }
+        } else {
+            /* make sure the close request is sent; we set timeout to an arbitrary
+             * (but reasonable) number of milliseconds since we want the call to block*/
+            rc = adaptor_send_queue(zh, 3000);
 
-        /* make sure the close request is sent; we set timeout to an arbitrary
-         * (but reasonable) number of milliseconds since we want the call to block*/
-        rc=adaptor_send_queue(zh, 3000);
-    }else{
-        LOG_INFO(LOGCALLBACK(zh), "Freeing zookeeper resources for sessionId=%#llx\n",
-                zh->client_id.client_id);
+            /* give some time to the server to process the session close request properly */
+            rc = rc < 0 ? rc : wait_for_session_to_be_closed(zh, 1500);
+        }
+    } else {
         rc = ZOK;
     }
 
-finish:
+    LOG_INFO(LOGCALLBACK(zh), "Freeing zookeeper resources for sessionId=%#llx\n", zh->client_id.client_id);
     destroy(zh);
     adaptor_destroy(zh);
     free(zh->fd);
@@ -4858,6 +4958,10 @@ const char* zerror(int c)
       return "the watcher couldn't be found";
     case ZRECONFIGDISABLED:
       return "attempts to perform a reconfiguration operation when reconfiguration feature is disable";
+    case ZSESSIONCLOSEDREQUIRESASLAUTH:
+      return "session closed by server because client is required to do SASL authentication";
+    case ZTHROTTLEDOP:
+      return "Operation was throttled due to high load";
     }
     if (c > 0) {
       return strerror(c);
@@ -4912,7 +5016,7 @@ int zoo_add_auth(zhandle_t *zh,const char* scheme,const char* cert,
 
 static const char* format_endpoint_info(const struct sockaddr_storage* ep)
 {
-    static char buf[128] = { 0 };
+    static char buf[134] = { 0 };
     char addrstr[INET6_ADDRSTRLEN] = { 0 };
     const char *fmtstring;
     void *inaddr;
